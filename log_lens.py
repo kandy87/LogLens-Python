@@ -33,11 +33,14 @@ from array import array
 from datetime import datetime
 
 from PySide6.QtCore import (
-    Qt, QAbstractTableModel, QModelIndex, QThread, Signal, QTimer, QRect, QSize
+    Qt, QAbstractTableModel, QModelIndex, QThread, Signal, QTimer, QRect, QRectF, QSize, QPointF, QPoint
 )
-from PySide6.QtGui import QColor, QPainter, QFont
+from PySide6.QtGui import (
+    QColor, QPainter, QFont, QFontMetricsF, QIcon, QKeySequence, QPen, QShortcut,
+    QTextLayout, QTextLine, QTextCharFormat, QTextOption
+)
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+    QApplication, QMainWindow, QMenu, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QLineEdit, QPushButton, QCheckBox, QComboBox, QFileDialog, QTableView,
     QHeaderView, QStyledItemDelegate, QStyle, QStackedWidget, QFrame
 )
@@ -65,10 +68,17 @@ KW_MARK_BG = QColor(74, 144, 226, 82)     # rgba(74,144,226,0.32)
 KW_MARK_TEXT = QColor("#eaf3ff")
 TRACE_MARK_BG = QColor(255, 180, 84, 82)  # rgba(255,180,84,0.32)
 TRACE_MARK_TEXT = QColor("#fff4e0")
+ROW_DIVIDER = QColor(38, 49, 64, 102)     # rgba(38,49,64,0.4) — matches td's border-bottom
+TEXT_SEL_BG = QColor(74, 144, 226, 90)    # translucent blue overlay for cursor-drag text selection
 
 SOURCE_COLORS = ['#4a90e2', '#5fd68a', '#f2b155', '#c792ea', '#ff8fa3', '#4fc1c9']
 
-ROW_HEIGHT = 24
+# The web version pads each row 9px top/bottom and uses line-height:1.6 for
+# wrapped text; ROW_HEIGHT (a single unwrapped line) and LINE_HEIGHT_FACTOR
+# (spacing between wrapped lines within one row) mirror that so rows read
+# with the same breathing room instead of feeling cramped.
+ROW_HEIGHT = 38
+LINE_HEIGHT_FACTOR = 1.6
 CHUNK_SIZE = 8 * 1024 * 1024  # 8 MB scan chunks
 
 STYLESHEET = f"""
@@ -234,6 +244,14 @@ def parse_datetime_field(text: str):
         except ValueError:
             continue
     return None  # unparsable -> treated as no bound
+
+
+def resource_path(name: str) -> str:
+    """Resolve a bundled asset (e.g. favicon.ico) both when run from source
+    and when frozen by PyInstaller/pynsist, whose bundles unpack alongside
+    the executable rather than next to this .py file."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, name)
 
 
 def human_size(n: int) -> str:
@@ -742,13 +760,109 @@ class LogTableModel(QAbstractTableModel):
         return runs
 
 
+def draw_row_divider(painter: QPainter, rect: QRect):
+    """A subtle line under each row, matching the web version's
+    `border-bottom:1px solid rgba(38,49,64,0.4)` on every <td> — without it,
+    rows have no visual separator and reading down a column of wrapped text
+    blurs together."""
+    painter.save()
+    pen = QPen(ROW_DIVIDER)
+    pen.setWidth(1)
+    painter.setPen(pen)
+    y = rect.bottom()
+    painter.drawLine(rect.left(), y, rect.right(), y)
+    painter.restore()
+
+
 class LogLineDelegate(QStyledItemDelegate):
     """Paints column 2 (the log text) with level/method coloring and
-    keyword/trace highlight marks, single-line with horizontal scroll."""
+    keyword/trace highlight marks. Two modes, toggled by `wrap_enabled`:
+    single-line with horizontal scroll (fixed row height — cheap at any
+    row count), or wrapped like the original web version (variable row
+    height — matches the source exactly but costs more at huge row counts,
+    which is why it's a toggle rather than the only option)."""
+
+    PAD_X = 10
+    PAD_Y = 9
 
     def __init__(self, model: LogTableModel, parent=None):
         super().__init__(parent)
         self.model_ref = model
+        self.wrap_enabled = True
+        self.table_ref = None  # set by the window after the table view exists;
+        # lets paint() ask "is any character range in this row selected?"
+        # Qt gives sizeHint() an option.rect with width 0 (there's a genuine
+        # circular dependency: our row height depends on column width, and
+        # the stretched column's width depends on whether a vertical
+        # scrollbar is needed, which depends on total row height). So the
+        # wrap width is tracked here independently and kept in sync by the
+        # window on layout/resize, rather than trusted from option.rect.
+        self.wrap_width = 600
+
+    def _build_layout(self, text, width, font):
+        """Lay out `text` wrapped to `width` px, with per-run coloring
+        applied via QTextLayout's native rich-formatting support (handles
+        wrapping and highlight spans together correctly, including spans
+        that straddle a wrap point)."""
+        layout = QTextLayout(text, font)
+        opt = QTextOption()
+        opt.setWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
+        layout.setTextOption(opt)
+
+        formats = []
+        for s, e, bg_cls, fg_color in self.model_ref.compute_render_runs(text):
+            if e <= s:
+                continue
+            fmt = QTextCharFormat()
+            if bg_cls == 'kw':
+                fmt.setBackground(KW_MARK_BG)
+                fmt.setForeground(KW_MARK_TEXT)
+            elif bg_cls == 'trace':
+                fmt.setBackground(TRACE_MARK_BG)
+                fmt.setForeground(TRACE_MARK_TEXT)
+            else:
+                fmt.setForeground(QColor(TEXT))
+            if fg_color:
+                fmt.setForeground(QColor(fg_color))
+                bold = QFont(font)
+                bold.setBold(True)
+                fmt.setFont(bold)
+            fr = QTextLayout.FormatRange()
+            fr.start = s
+            fr.length = e - s
+            fr.format = fmt
+            formats.append(fr)
+        layout.setFormats(formats)
+
+        # Uniform per-line spacing derived from the font, scaled by
+        # LINE_HEIGHT_FACTOR — matches the web version's `line-height:1.6`
+        # (QTextLine.height() alone gives the font's natural ~1.15x
+        # leading, which reads as noticeably tighter).
+        line_spacing = QFontMetricsF(font).height() * LINE_HEIGHT_FACTOR
+
+        layout.beginLayout()
+        n_lines = 0
+        while True:
+            line = layout.createLine()
+            if not line.isValid():
+                break
+            line.setLineWidth(max(1, width))
+            line.setPosition(QPointF(0, n_lines * line_spacing))
+            n_lines += 1
+        layout.endLayout()
+        return layout, n_lines * line_spacing, line_spacing
+
+    def _selection_range_for(self, row, text_len):
+        """(start, end) char offsets selected in this row by the table's
+        cursor-drag text selection, or None. `end` is already clamped to
+        text_len (a row fully inside a multi-row selection gets (0, text_len))."""
+        if self.table_ref is None:
+            return None
+        rng = self.table_ref.get_text_selection_range_for_row(row)
+        if rng is None:
+            return None
+        s, e = rng
+        return (max(0, s), text_len if e is None else min(text_len, e))
 
     def paint(self, painter: QPainter, option, index):
         if index.column() != 2:
@@ -762,12 +876,48 @@ class LogLineDelegate(QStyledItemDelegate):
         if option.state & QStyle.State_Selected:
             painter.fillRect(option.rect, option.palette.highlight())
 
+        sel_range = self._selection_range_for(index.row(), len(text))
+
+        if self.wrap_enabled:
+            # Use the tracked width, not option.rect.width(), so wrapping is
+            # identical to what sizeHint() reserved room for (see __init__).
+            width = self.wrap_width - 2 * self.PAD_X
+            layout, _total_h, line_spacing = self._build_layout(text, width, option.font)
+            origin = QPointF(option.rect.x() + self.PAD_X, option.rect.y() + self.PAD_Y)
+            if sel_range and sel_range[1] > sel_range[0]:
+                s, e = sel_range
+                painter.setPen(Qt.NoPen)
+                for li in range(layout.lineCount()):
+                    line = layout.lineAt(li)
+                    ls = line.textStart()
+                    le = ls + line.textLength()
+                    ss, ee = max(s, ls), min(e, le)
+                    if ee > ss:
+                        x1, _ = line.cursorToX(ss)
+                        x2, _ = line.cursorToX(ee)
+                        rect = QRectF(
+                            origin.x() + min(x1, x2), origin.y() + line.position().y(),
+                            abs(x2 - x1), line_spacing
+                        )
+                        painter.fillRect(rect, TEXT_SEL_BG)
+            painter.setPen(QColor(TEXT))
+            layout.draw(painter, origin)
+            draw_row_divider(painter, option.rect)
+            painter.restore()
+            return
+
         fm = option.fontMetrics
-        pad = 8
+        pad = self.PAD_X
         x = option.rect.x() + pad
         y = option.rect.y()
         h = option.rect.height()
         max_x = option.rect.right()
+
+        if sel_range and sel_range[1] > sel_range[0]:
+            s, e = sel_range
+            x1 = x + fm.horizontalAdvance(text[:s])
+            x2 = x + fm.horizontalAdvance(text[:e])
+            painter.fillRect(QRect(x1, y, max(0, min(x2, max_x) - x1), h), TEXT_SEL_BG)
 
         base_font = option.font
         bold_font = QFont(base_font)
@@ -800,10 +950,18 @@ class LogLineDelegate(QStyledItemDelegate):
             painter.drawText(QRect(x, y, max(0, max_x - x), h), Qt.AlignVCenter | Qt.TextSingleLine, seg)
             x += w
 
+        draw_row_divider(painter, option.rect)
         painter.restore()
 
     def sizeHint(self, option, index):
-        return QSize(option.rect.width(), ROW_HEIGHT)
+        if not self.wrap_enabled or index.column() != 2:
+            return QSize(option.rect.width(), ROW_HEIGHT)
+        # Qt calls sizeHint() with option.rect.width() == 0 for this column
+        # (see the note in __init__), so use the independently tracked width.
+        text = index.data(Qt.DisplayRole) or ""
+        width = self.wrap_width - 2 * self.PAD_X
+        _layout, total_h, _line_spacing = self._build_layout(text, width, option.font)
+        return QSize(self.wrap_width, max(ROW_HEIGHT, int(total_h) + 2 * self.PAD_Y))
 
 
 class SourceBadgeDelegate(QStyledItemDelegate):
@@ -822,6 +980,7 @@ class SourceBadgeDelegate(QStyledItemDelegate):
         file_idx, _ = self.model_ref.entry_for_row(index.row())
         lf = self.model_ref.files[file_idx] if self.model_ref.files else None
         if lf is None:
+            draw_row_divider(painter, option.rect)
             painter.restore()
             return
 
@@ -845,10 +1004,182 @@ class SourceBadgeDelegate(QStyledItemDelegate):
         painter.drawRoundedRect(rect, 4, 4)
         painter.setPen(color)
         painter.drawText(rect.adjusted(pad_h, 0, -pad_h, 0), Qt.AlignVCenter | Qt.AlignLeft, text)
+        draw_row_divider(painter, option.rect)
         painter.restore()
 
     def sizeHint(self, option, index):
         return QSize(option.rect.width(), ROW_HEIGHT)
+
+
+class LineNoDelegate(QStyledItemDelegate):
+    """Column 1 (the line number) otherwise just uses default rendering —
+    this only exists to add the same row divider the other two columns
+    draw, so the line is continuous across the full row width."""
+
+    def paint(self, painter: QPainter, option, index):
+        super().paint(painter, option, index)
+        draw_row_divider(painter, option.rect)
+
+
+class LogTableView(QTableView):
+    """QTableView with an added cursor-drag text-selection mode for column 2
+    (the log text), on top of its normal row selection for columns 0/1.
+
+    The text in column 2 is custom-painted by LogLineDelegate (needed for
+    wrapping + highlight marks at file-scale), so Qt's native selection
+    machinery has no idea individual characters exist there — clicking and
+    dragging only ever selected whole rows. This adds real character-level
+    hit-testing (via the same QTextLayout the delegate paints with, so
+    coordinates always agree) plus an anchor/end selection range that spans
+    rows, mirroring how text selection works in a normal text editor or in
+    the browser version of this tool.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.line_delegate = None
+        self.text_sel_anchor = None  # (row, char_offset) or None
+        self.text_sel_end = None
+        self._dragging_text = False
+        self.setMouseTracking(False)
+
+    def set_line_delegate(self, delegate):
+        self.line_delegate = delegate
+
+    # -- Hit testing --------------------------------------------------
+    def _hit_test(self, pos: QPoint):
+        """Map a viewport pixel position to (row, char_offset) in column 2's
+        text, or None if pos isn't over that column."""
+        index = self.indexAt(pos)
+        if not index.isValid() or index.column() != 2 or self.line_delegate is None:
+            return None
+
+        rect = self.visualRect(index)
+        text = index.data(Qt.DisplayRole) or ""
+        delegate = self.line_delegate
+        font = self.font()
+        local_x = pos.x() - rect.x() - delegate.PAD_X
+        local_y = pos.y() - rect.y() - delegate.PAD_Y
+
+        width = (delegate.wrap_width - 2 * delegate.PAD_X) if delegate.wrap_enabled else 10_000_000
+        layout, _total_h, line_spacing = delegate._build_layout(text, max(1, width), font)
+
+        if layout.lineCount() == 0:
+            return (index.row(), 0)
+
+        line_idx = 0
+        if line_spacing > 0:
+            line_idx = max(0, min(layout.lineCount() - 1, int(local_y // line_spacing)))
+        line = layout.lineAt(line_idx)
+        offset = line.xToCursor(local_x, QTextLine.CursorBetweenCharacters)
+        return (index.row(), offset)
+
+    def _row_edge_hit(self, pos: QPoint):
+        """Fallback for drag-selecting past the top/bottom of the loaded
+        text column (e.g. dragging into the header, or below the last row):
+        clamps to the nearest row's start or end offset."""
+        row = self.rowAt(pos.y())
+        if row == -1:
+            row = self.model().rowCount() - 1 if pos.y() > 0 else 0
+        if row < 0:
+            return None
+        idx = self.model().index(row, 2)
+        text = idx.data(Qt.DisplayRole) or ""
+        rect = self.visualRect(idx)
+        offset = 0 if pos.y() < rect.y() else len(text)
+        return (row, offset)
+
+    # -- Mouse events for cursor-drag text selection -------------------
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            pos = event.position().toPoint()
+            hit = self._hit_test(pos)
+            if hit is not None:
+                self.clearSelection()
+                self.text_sel_anchor = hit
+                self.text_sel_end = hit
+                self._dragging_text = True
+                self.viewport().update()
+                event.accept()
+                return
+            elif self.text_sel_anchor is not None:
+                self.text_sel_anchor = None
+                self.text_sel_end = None
+                self.viewport().update()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._dragging_text:
+            pos = event.position().toPoint()
+            hit = self._hit_test(pos) or self._row_edge_hit(pos)
+            if hit is not None:
+                self.text_sel_end = hit
+                self.viewport().update()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._dragging_text:
+            self._dragging_text = False
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    # -- Selection state, queried by the delegate and by copy actions --
+    def clear_text_selection(self):
+        if self.text_sel_anchor is not None or self.text_sel_end is not None:
+            self.text_sel_anchor = None
+            self.text_sel_end = None
+            self.viewport().update()
+
+    def has_text_selection(self):
+        return (
+            self.text_sel_anchor is not None
+            and self.text_sel_end is not None
+            and self.text_sel_anchor != self.text_sel_end
+        )
+
+    def _ordered_selection(self):
+        (ar, ao), (er, eo) = self.text_sel_anchor, self.text_sel_end
+        if (ar, ao) <= (er, eo):
+            return ar, ao, er, eo
+        return er, eo, ar, ao
+
+    def get_text_selection_range_for_row(self, row):
+        """(start_offset, end_offset_or_None) selected within `row`'s text,
+        or None if that row isn't part of the current selection. A `None`
+        end means "to the end of the line" (the caller knows the length)."""
+        if not self.has_text_selection():
+            return None
+        start_row, start_off, end_row, end_off = self._ordered_selection()
+        if row < start_row or row > end_row:
+            return None
+        if start_row == end_row:
+            return (min(start_off, end_off), max(start_off, end_off))
+        if row == start_row:
+            return (start_off, None)
+        if row == end_row:
+            return (0, end_off)
+        return (0, None)
+
+    def get_selected_text(self):
+        if not self.has_text_selection():
+            return ""
+        start_row, start_off, end_row, end_off = self._ordered_selection()
+        model = self.model()
+        parts = []
+        for row in range(start_row, end_row + 1):
+            text = model.index(row, 2).data(Qt.DisplayRole) or ""
+            if row == start_row and row == end_row:
+                parts.append(text[start_off:end_off])
+            elif row == start_row:
+                parts.append(text[start_off:])
+            elif row == end_row:
+                parts.append(text[:end_off])
+            else:
+                parts.append(text)
+        return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -860,6 +1191,9 @@ class LogLensWindow(QMainWindow):
         self.setWindowTitle("Log Lens")
         self.resize(1320, 820)
         self.setAcceptDrops(True)
+        icon_path = resource_path("favicon.ico")
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
 
         self.model = LogTableModel()
         self.files = []  # list[LoadedFile], authoritative load order
@@ -874,6 +1208,14 @@ class LogLensWindow(QMainWindow):
         self.debounce.setSingleShot(True)
         self.debounce.setInterval(350)
         self.debounce.timeout.connect(self.run_filter)
+
+        # Wrapped rows need re-flowing when the (stretched) text column's
+        # width changes, e.g. on window resize — debounced so dragging the
+        # window edge doesn't re-lay-out every intermediate frame.
+        self.wrap_resize_debounce = QTimer(self)
+        self.wrap_resize_debounce.setSingleShot(True)
+        self.wrap_resize_debounce.setInterval(150)
+        self.wrap_resize_debounce.timeout.connect(self._relayout_rows)
 
         self._build_ui()
 
@@ -924,12 +1266,12 @@ class LogLensWindow(QMainWindow):
         self.open_btn = QPushButton("Open log files")
         self.open_btn.setObjectName("primary")
         self.open_btn.clicked.connect(self.open_file_dialog)
-        toolbar.addWidget(self.open_btn)
+        toolbar.addLayout(self._field("", self.open_btn))
 
         self.remove_all_btn = QPushButton("Remove all files")
         self.remove_all_btn.setEnabled(False)
         self.remove_all_btn.clicked.connect(self.remove_all_files)
-        toolbar.addWidget(self.remove_all_btn)
+        toolbar.addLayout(self._field("", self.remove_all_btn))
 
         self.keyword_input = QLineEdit()
         self.keyword_input.setPlaceholderText("e.g. exception, failed")
@@ -953,8 +1295,20 @@ class LogLensWindow(QMainWindow):
 
         self.case_checkbox = QCheckBox("case sensitive")
         self.regex_checkbox = QCheckBox("regex")
-        toolbar.addWidget(self.case_checkbox)
-        toolbar.addWidget(self.regex_checkbox)
+        self.wrap_checkbox = QCheckBox("wrap text")
+        self.wrap_checkbox.setChecked(True)
+        self.wrap_checkbox.setToolTip(
+            "Wrap long lines like the web version. Turn off for very large files "
+            "if scrolling gets sluggish — fixed-height rows scroll faster."
+        )
+        checkbox_row = QWidget()
+        checkbox_row_layout = QHBoxLayout(checkbox_row)
+        checkbox_row_layout.setContentsMargins(0, 0, 0, 0)
+        checkbox_row_layout.setSpacing(12)
+        checkbox_row_layout.addWidget(self.case_checkbox)
+        checkbox_row_layout.addWidget(self.regex_checkbox)
+        checkbox_row_layout.addWidget(self.wrap_checkbox)
+        toolbar.addLayout(self._field("", checkbox_row))
 
         self.combine_combo = QComboBox()
         self.combine_combo.addItem("Match ALL (AND)", "and")
@@ -963,12 +1317,12 @@ class LogLensWindow(QMainWindow):
 
         self.clear_btn = QPushButton("Clear filters")
         self.clear_btn.clicked.connect(self.clear_filters)
-        toolbar.addWidget(self.clear_btn)
+        toolbar.addLayout(self._field("", self.clear_btn))
 
         self.export_btn = QPushButton("Export matches")
         self.export_btn.setEnabled(False)
         self.export_btn.clicked.connect(self.export_matches)
-        toolbar.addWidget(self.export_btn)
+        toolbar.addLayout(self._field("", self.export_btn))
 
         toolbar.addStretch(1)
         v.addLayout(toolbar)
@@ -985,14 +1339,22 @@ class LogLensWindow(QMainWindow):
         self.case_checkbox.toggled.connect(lambda _=None: self.debounce.start())
         self.regex_checkbox.toggled.connect(lambda _=None: self.debounce.start())
         self.combine_combo.currentIndexChanged.connect(lambda _=None: self.debounce.start())
+        self.wrap_checkbox.toggled.connect(self.set_wrap_enabled)
 
         return header
 
     def _field(self, label_text, widget):
+        """Wrap `widget` in a labeled column for the toolbar. Every toolbar
+        item goes through this — including buttons and checkboxes, with an
+        empty label — so every item shares the same two-row (label + control)
+        shape and lines up on one baseline instead of the shorter widgets
+        drifting to Qt's default vertical-centering, which visually collides
+        with its taller neighbors."""
         col = QVBoxLayout()
         col.setSpacing(3)
-        label = QLabel(label_text)
-        label.setStyleSheet(f"color:{TEXT_DIM}; font-size:10px; padding-left:2px;")
+        label = QLabel(label_text if label_text else " ")
+        color = TEXT_DIM if label_text else "transparent"
+        label.setStyleSheet(f"color:{color}; font-size:10px; padding-left:2px;")
         col.addWidget(label)
         col.addWidget(widget)
         return col
@@ -1059,34 +1421,131 @@ class LogLensWindow(QMainWindow):
         return w
 
     def _build_table(self):
-        self.table = QTableView()
+        self.table = LogTableView()
         self.table.setModel(self.model)
+        # set_files() and set_filtered() both wrap their changes in
+        # beginResetModel()/endResetModel(), which Qt turns into this signal —
+        # one hook covers every case where a previously-selected row's text
+        # could no longer exist or now mean something different.
+        self.model.modelReset.connect(self.table.clear_text_selection)
         self.source_delegate = SourceBadgeDelegate(self.model)
+        self.lineno_delegate = LineNoDelegate()
         self.line_delegate = LogLineDelegate(self.model)
+        self.line_delegate.table_ref = self.table
+        self.table.set_line_delegate(self.line_delegate)
         self.table.setItemDelegateForColumn(0, self.source_delegate)
+        self.table.setItemDelegateForColumn(1, self.lineno_delegate)
         self.table.setItemDelegateForColumn(2, self.line_delegate)
         self.table.setShowGrid(False)
         self.table.setSelectionBehavior(QTableView.SelectRows)
-        self.table.setWordWrap(False)
+        self.table.setSelectionMode(QTableView.ExtendedSelection)  # click/shift-click/ctrl-click on source/line-number columns
+        self.table.setWordWrap(False)  # we lay out wrapped text ourselves in the delegate
         self.table.setAlternatingRowColors(False)
         self.table.setEditTriggers(QTableView.NoEditTriggers)
 
-        vh = self.table.verticalHeader()
-        vh.setSectionResizeMode(QHeaderView.Fixed)
-        vh.setDefaultSectionSize(ROW_HEIGHT)
-        vh.setVisible(False)
+        # Column 2 (the log text) supports real cursor-drag character
+        # selection (see LogTableView) — click and drag across the text,
+        # then Ctrl+C or right-click Copy, just like a text editor.
+        # Columns 0/1 (source, line number) still use row selection, since
+        # there's nothing meaningful to select character-by-character there.
+        copy_shortcut = QShortcut(QKeySequence.Copy, self.table)
+        copy_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        copy_shortcut.activated.connect(self.copy_selected_rows)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._show_table_context_menu)
 
         hh = self.table.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.Fixed)
         hh.setSectionResizeMode(1, QHeaderView.Fixed)
-        hh.setSectionResizeMode(2, QHeaderView.Fixed)
         self.table.setColumnWidth(0, 130)
         self.table.setColumnWidth(1, 70)
-        self.table.setColumnWidth(2, 20000)
         hh.setVisible(False)
         self.table.setColumnHidden(0, True)  # shown only with 2+ files loaded
+        self.table.verticalScrollBar().valueChanged.connect(self._on_scroll)
 
+        self.set_wrap_enabled(True)  # matches the web version's default (wrapped)
         return self.table
+
+    def set_wrap_enabled(self, enabled):
+        """Toggle between wrapped rows (matches the web version, variable
+        row height) and single-line rows with horizontal scroll (fixed
+        row height). Wrapped row heights are computed lazily for only the
+        rows on screen (see _update_visible_row_heights) rather than via
+        Qt's built-in ResizeToContents, which computes every row up front —
+        fine for a few thousand rows, but a multi-minute hang for the
+        multi-million-row files this app exists to handle. Unwrapping
+        remains available as a fully fixed-height fallback."""
+        self.line_delegate.wrap_enabled = enabled
+        hh = self.table.horizontalHeader()
+        if enabled:
+            hh.setSectionResizeMode(2, QHeaderView.Stretch)
+            vh = self.table.verticalHeader()
+            vh.setSectionResizeMode(QHeaderView.Fixed)
+            vh.setDefaultSectionSize(ROW_HEIGHT)  # estimate for not-yet-visible rows
+        else:
+            hh.setSectionResizeMode(2, QHeaderView.Fixed)
+            self.table.setColumnWidth(2, 20000)
+            # Wrapped mode records an explicit height per visited row (via
+            # setRowHeight in _update_visible_row_heights); switching back
+            # doesn't discard those on its own, so rows would keep their old
+            # wrapped height forever. Installing a fresh header is how Qt
+            # discards that per-row size cache in O(1) rather than us
+            # visiting every row — which matters when there can be tens of
+            # millions of them.
+            vh = QHeaderView(Qt.Vertical, self.table)
+            vh.setSectionResizeMode(QHeaderView.Fixed)
+            vh.setDefaultSectionSize(ROW_HEIGHT)
+            self.table.setVerticalHeader(vh)
+        vh.setVisible(False)
+        self._relayout_rows()
+
+    def _relayout_rows(self):
+        if self.wrap_checkbox.isChecked():
+            col_width = self.table.columnWidth(2)
+            if col_width > 0:
+                self.line_delegate.wrap_width = col_width
+            self._update_visible_row_heights()
+        self.table.viewport().update()
+
+    def _on_scroll(self, _value):
+        if self.wrap_checkbox.isChecked():
+            self._update_visible_row_heights()
+
+    def _update_visible_row_heights(self):
+        """Compute and set exact wrapped heights for just the rows on
+        screen (plus a small buffer), so cost stays bounded by viewport
+        size — a few dozen rows — no matter how many rows the model has."""
+        row_count = self.model.rowCount()
+        if row_count == 0:
+            return
+        viewport_h = self.table.viewport().height()
+        top_row = self.table.rowAt(0)
+        if top_row == -1:
+            top_row = 0
+        bottom_row = self.table.rowAt(max(0, viewport_h - 1))
+        if bottom_row == -1:
+            bottom_row = min(row_count - 1, top_row + 60)
+        top_row = max(0, top_row - 5)
+        bottom_row = min(row_count - 1, bottom_row + 5)
+
+        col_width = self.table.columnWidth(2)
+        if col_width > 0:
+            self.line_delegate.wrap_width = col_width
+        width = self.line_delegate.wrap_width - 2 * LogLineDelegate.PAD_X
+        font = self.table.font()
+
+        for row in range(top_row, bottom_row + 1):
+            idx = self.model.index(row, 2)
+            text = self.model.data(idx, Qt.DisplayRole) or ""
+            _layout, h, _line_spacing = self.line_delegate._build_layout(text, width, font)
+            needed = max(ROW_HEIGHT, int(h) + 2 * LogLineDelegate.PAD_Y)
+            if self.table.rowHeight(row) != needed:
+                self.table.setRowHeight(row, needed)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.wrap_checkbox.isChecked():
+            self.wrap_resize_debounce.start()
 
     # -- Drag & drop ---------------------------------------------------
     def dragEnterEvent(self, event):
@@ -1301,8 +1760,16 @@ class LogLensWindow(QMainWindow):
         if no_filter:
             if self.filter_worker is not None:
                 self.filter_worker.cancel()
+                # cancel() only sets a flag the worker thread checks; if it
+                # had already finished and queued its finished_ok signal
+                # before this, that signal is still coming. Clearing the
+                # reference (rather than leaving it pointing at a "cancelled"
+                # worker) makes _on_filtered's "worker is not self.filter_worker"
+                # check reject that stale result instead of applying it over
+                # the None we're about to set.
+                self.filter_worker = None
             self.model.set_filtered(None)
-            self.table.viewport().update()
+            self._relayout_rows()
             self.update_status()
             return
 
@@ -1325,7 +1792,7 @@ class LogLensWindow(QMainWindow):
         if worker is not self.filter_worker:
             return  # superseded by a newer search
         self.model.set_filtered(matches)
-        self.table.viewport().update()
+        self._relayout_rows()
         self.export_btn.setEnabled(True)
         self.update_status()
 
@@ -1353,6 +1820,41 @@ class LogLensWindow(QMainWindow):
         else:
             parts.append("Showing all lines")
         self.status_label.setText("&nbsp;&nbsp;&nbsp;".join(parts))
+
+    # -- Copy ------------------------------------------------------------
+    def copy_selected_rows(self):
+        if not self.files:
+            return
+
+        # A cursor-drag text selection (exact character range, possibly
+        # spanning rows) takes priority over row selection when both could
+        # apply — it's the more specific, more recently made choice.
+        if self.table.has_text_selection():
+            QApplication.clipboard().setText(self.table.get_selected_text())
+            return
+
+        selection_model = self.table.selectionModel()
+        if selection_model is None or not selection_model.hasSelection():
+            return
+        rows = sorted(idx.row() for idx in selection_model.selectedRows())
+        if not rows:
+            return
+        multi = self.model.multi
+        lines = []
+        for row in rows:
+            file_idx, line_no = self.model.entry_for_row(row)
+            lf = self.model.files[file_idx]
+            text = lf.line_text(line_no)
+            lines.append(f"[{lf.name}] {text}" if multi else text)
+        QApplication.clipboard().setText("\n".join(lines))
+
+    def _show_table_context_menu(self, pos):
+        if not self.table.selectionModel().hasSelection() and not self.table.has_text_selection():
+            return
+        menu = QMenu(self.table)
+        copy_action = menu.addAction("Copy")
+        copy_action.triggered.connect(self.copy_selected_rows)
+        menu.exec(self.table.viewport().mapToGlobal(pos))
 
     # -- Export --------------------------------------------------------
     def export_matches(self):
@@ -1401,6 +1903,9 @@ class LogLensWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setStyleSheet(STYLESHEET)
+    icon_path = resource_path("favicon.ico")
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
     win = LogLensWindow()
     win.show()
     sys.exit(app.exec())
