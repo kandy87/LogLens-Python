@@ -29,6 +29,7 @@ import re
 import sys
 import mmap
 import os
+import base64
 from array import array
 from datetime import datetime
 
@@ -36,7 +37,7 @@ from PySide6.QtCore import (
     Qt, QAbstractTableModel, QModelIndex, QThread, Signal, QTimer, QRect, QRectF, QSize, QPointF, QPoint
 )
 from PySide6.QtGui import (
-    QColor, QPainter, QFont, QFontMetricsF, QIcon, QKeySequence, QPen, QShortcut,
+    QColor, QPainter, QFont, QFontMetricsF, QIcon, QPixmap, QKeySequence, QPen, QShortcut,
     QTextLayout, QTextLine, QTextCharFormat, QTextOption
 )
 from PySide6.QtWidgets import (
@@ -66,8 +67,6 @@ LVL_DEBUG = "#8a97ab"
 
 KW_MARK_BG = QColor(74, 144, 226, 82)     # rgba(74,144,226,0.32)
 KW_MARK_TEXT = QColor("#eaf3ff")
-TRACE_MARK_BG = QColor(255, 180, 84, 82)  # rgba(255,180,84,0.32)
-TRACE_MARK_TEXT = QColor("#fff4e0")
 ROW_DIVIDER = QColor(38, 49, 64, 102)     # rgba(38,49,64,0.4) — matches td's border-bottom
 TEXT_SEL_BG = QColor(74, 144, 226, 90)    # translucent blue overlay for cursor-drag text selection
 
@@ -254,6 +253,44 @@ def resource_path(name: str) -> str:
     return os.path.join(base, name)
 
 
+# Tiny (627-byte) multi-resolution .ico embedded directly in source, so the
+# window/taskbar icon is never the OS's generic "python.exe" icon even if
+# favicon.ico wasn't kept alongside this file — it's the same amber
+# magnifying-glass mark used everywhere else in the app, just baked in as a
+# guaranteed fallback rather than a bundled asset that could go missing.
+_EMBEDDED_ICON_B64 = (
+    "AAABAAEAEBAAAAAAIABdAgAAFgAAAIlQTkcNChoKAAAADUlIRFIAAAAQAAAAEAgGAAAAH/P/YQAA"
+    "AiRJREFUeJylkztrVFEUhb99zr03d2bymARNkxAIJA6CJiFgJ9iYQkFbC4mVbUII2OQHGMTCwtZC"
+    "SEBLQZgiipVVCMRHUEOEoCAWksnDzIM795xtMZm8U7ngNKdY7L2+tQWgZ3DkZprUHqtzF2lIOF0K"
+    "INZ+DaL4wa+1D0XpuTByIynvvq4nNauqCogIGGl4eFVUDxwVVEQkjGIX5VpvSXdfYS2plgcAB1hj"
+    "BO+VnaoDoD1jaf4dkgNslMl9D/B+AFVFxBojlGuO0Aq3r3QB8PbjFvXEk4vtYROLquL9gHT3Dvqk"
+    "VhFjDZWa41JflmcTBbzzABhruP90lZWfFbKHTVSJ4qyaZmDeK4EV5icKFJdKjE4vMzq9THGpxPxE"
+    "gcCeWANADIAxwk41ZWwoT5IqM3PrdLWFdLWFzMytU0+VsaE8O9UUa44CMmfgOiFjTidrmuO3ZwLe"
+    "fNoiCoSH4/2U/iaU/taZHe8HgVeLG3TmQtyxNaS7d1CTWoWTIeo++xYDU8/XWVje5Fw+JHXaDPHA"
+    "ABEOY7w+nEdEKC5ucO1ynpdTBe48+ca7lW06cgHe+X0Dn9Qqwl7zjhRJobM1YGO7zthIJwuzw9x7"
+    "9IUX7//QkbXYKKPNCbRR4KOhCeD28JZ2U+5ePc/q7yqff5SJQ9GwJSsnqnwWBWuEzXJKS2CII3Gq"
+    "jSqbMM5MhlHsgMYxaSOg4y91nnzWEoeoKjaMYhfGmUmB/zvnfx1EFLCRtPt4AAAAAElFTkSuQmCC"
+)
+_embedded_icon_cache = None
+
+
+def app_icon() -> QIcon:
+    """The window/taskbar icon: prefer a bundled favicon.ico next to the
+    script/executable (lets a packager or the user swap in their own art),
+    falling back to the icon embedded above so branding is never silently
+    dropped just because that file wasn't carried along."""
+    icon_path = resource_path("favicon.ico")
+    if os.path.exists(icon_path):
+        return QIcon(icon_path)
+
+    global _embedded_icon_cache
+    if _embedded_icon_cache is None:
+        pixmap = QPixmap()
+        pixmap.loadFromData(base64.b64decode(_EMBEDDED_ICON_B64), "ICO")
+        _embedded_icon_cache = QIcon(pixmap)
+    return _embedded_icon_cache
+
+
 def human_size(n: int) -> str:
     for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
         if n < 1024:
@@ -411,14 +448,13 @@ class FilterWorker(QThread):
     failed = Signal(str)
 
     def __init__(self, files, order_file, order_line, total_rows,
-                 keyword, traceid, case_sensitive, regex_mode, from_dt, to_dt, combine_mode):
+                 keywords, case_sensitive, regex_mode, from_dt, to_dt, combine_mode):
         super().__init__()
         self.files = files
         self.order_file = order_file  # None => single-file direct mode (row == line_no in files[0])
         self.order_line = order_line
         self.total_rows = total_rows
-        self.keyword = keyword
-        self.traceid = traceid
+        self.keywords = keywords  # list[str], already stripped of blanks by the caller
         self.case_sensitive = case_sensitive
         self.regex_mode = regex_mode
         self.from_dt = from_dt
@@ -435,20 +471,18 @@ class FilterWorker(QThread):
         # lookups in favor of local variables — at tens of millions of
         # iterations that difference is the gap between ~45s and ~120s.
         try:
-            kw_search = None
-            if self.keyword:
-                pattern = self.keyword if self.regex_mode else re.escape(self.keyword)
+            kw_searches = []
+            if self.keywords:
                 flags = 0 if self.case_sensitive else re.IGNORECASE
-                try:
-                    kw_search = re.compile(pattern.encode('utf-8', 'surrogateescape'), flags).search
-                except re.error as e:
-                    self.failed.emit(f"Invalid regular expression: {e}")
-                    return
-
-            trace_needle = None
-            if self.traceid:
-                tb = self.traceid.encode('utf-8', 'surrogateescape')
-                trace_needle = tb if self.case_sensitive else tb.lower()
+                for kw in self.keywords:
+                    pattern = kw if self.regex_mode else re.escape(kw)
+                    try:
+                        kw_searches.append(
+                            re.compile(pattern.encode('utf-8', 'surrogateescape'), flags).search
+                        )
+                    except re.error as e:
+                        self.failed.emit(f"Invalid regular expression ({kw!r}): {e}")
+                        return
 
             case_sensitive = self.case_sensitive
             combine_or = self.combine_or
@@ -467,14 +501,9 @@ class FilterWorker(QThread):
             def line_matches(raw):
                 active = 0
                 passed = 0
-                if kw_search is not None:
+                for kw_search in kw_searches:
                     active += 1
                     if kw_search(raw) is not None:
-                        passed += 1
-                if trace_needle is not None:
-                    active += 1
-                    hay = raw if case_sensitive else raw.lower()
-                    if trace_needle in hay:
                         passed += 1
                 if date_active:
                     active += 1
@@ -602,8 +631,6 @@ class LogTableModel(QAbstractTableModel):
         self.filtered = None     # array('i') of row indices, or None (show everything)
 
         self.kw_re_str = None
-        self.trace_needle_str = None
-        self.trace_case_sensitive = False
 
     @property
     def multi(self):
@@ -623,10 +650,8 @@ class LogTableModel(QAbstractTableModel):
         self.filtered = filtered
         self.endResetModel()
 
-    def set_highlight(self, kw_re_str, trace_needle_str, case_sensitive):
+    def set_highlight(self, kw_re_str, case_sensitive):
         self.kw_re_str = kw_re_str
-        self.trace_needle_str = trace_needle_str
-        self.trace_case_sensitive = case_sensitive
 
     def close_all(self):
         for f in self.files:
@@ -676,38 +701,18 @@ class LogTableModel(QAbstractTableModel):
 
     # -- Rendering (level-word / method-name coloring + keyword/trace marks) --
     def _bg_spans(self, text):
-        """Background highlight spans: keyword matches and trace-id hits."""
+        """Background highlight spans: keyword matches (trace/request IDs
+        are just another keyword search term now, not a separate concept)."""
+        if not self.kw_re_str:
+            return []
         spans = []
-        if self.kw_re_str:
-            try:
-                for m in self.kw_re_str.finditer(text):
-                    if m.end() > m.start():
-                        spans.append((m.start(), m.end(), 'kw'))
-            except re.error:
-                pass
-        if self.trace_needle_str:
-            hay = text if self.trace_case_sensitive else text.lower()
-            needle = self.trace_needle_str if self.trace_case_sensitive else self.trace_needle_str.lower()
-            if needle:
-                start = 0
-                while True:
-                    i = hay.find(needle, start)
-                    if i == -1:
-                        break
-                    spans.append((i, i + len(needle), 'trace'))
-                    start = i + len(needle)
-        if not spans:
-            return spans
-        spans.sort(key=lambda s: s[0])
-        merged = [spans[0]]
-        for s in spans[1:]:
-            last = merged[-1]
-            if s[0] < last[1]:
-                if s[2] == 'trace':  # trace wins over keyword on overlap
-                    merged[-1] = (last[0], max(last[1], s[1]), 'trace')
-                continue
-            merged.append(s)
-        return merged
+        try:
+            for m in self.kw_re_str.finditer(text):
+                if m.end() > m.start():
+                    spans.append((m.start(), m.end(), 'kw'))
+        except re.error:
+            pass
+        return spans
 
     def _fg_spans(self, text):
         """Foreground color spans: the log-level word and any method:[name]."""
@@ -817,9 +822,6 @@ class LogLineDelegate(QStyledItemDelegate):
             if bg_cls == 'kw':
                 fmt.setBackground(KW_MARK_BG)
                 fmt.setForeground(KW_MARK_TEXT)
-            elif bg_cls == 'trace':
-                fmt.setBackground(TRACE_MARK_BG)
-                fmt.setForeground(TRACE_MARK_TEXT)
             else:
                 fmt.setForeground(QColor(TEXT))
             if fg_color:
@@ -934,9 +936,6 @@ class LogLineDelegate(QStyledItemDelegate):
             if bg_cls == 'kw':
                 painter.fillRect(QRect(x, y, min(w, max_x - x), h), KW_MARK_BG)
                 default_color = KW_MARK_TEXT
-            elif bg_cls == 'trace':
-                painter.fillRect(QRect(x, y, min(w, max_x - x), h), TRACE_MARK_BG)
-                default_color = TRACE_MARK_TEXT
             else:
                 default_color = QColor(TEXT)
 
@@ -1191,9 +1190,7 @@ class LogLensWindow(QMainWindow):
         self.setWindowTitle("Log Lens")
         self.resize(1320, 820)
         self.setAcceptDrops(True)
-        icon_path = resource_path("favicon.ico")
-        if os.path.exists(icon_path):
-            self.setWindowIcon(QIcon(icon_path))
+        self.setWindowIcon(app_icon())
 
         self.model = LogTableModel()
         self.files = []  # list[LoadedFile], authoritative load order
@@ -1263,25 +1260,23 @@ class LogLensWindow(QMainWindow):
         toolbar = QHBoxLayout()
         toolbar.setSpacing(8)
 
-        self.open_btn = QPushButton("Open log files")
+        self.open_btn = QPushButton("Open Logs")
         self.open_btn.setObjectName("primary")
         self.open_btn.clicked.connect(self.open_file_dialog)
         toolbar.addLayout(self._field("", self.open_btn))
 
-        self.remove_all_btn = QPushButton("Remove all files")
+        self.remove_all_btn = QPushButton("Remove Files")
         self.remove_all_btn.setEnabled(False)
         self.remove_all_btn.clicked.connect(self.remove_all_files)
         toolbar.addLayout(self._field("", self.remove_all_btn))
 
-        self.keyword_input = QLineEdit()
-        self.keyword_input.setPlaceholderText("e.g. exception, failed")
-        self.keyword_input.setMinimumWidth(210)
-        toolbar.addLayout(self._field("Keyword / text", self.keyword_input))
-
-        self.trace_input = QLineEdit()
-        self.trace_input.setPlaceholderText("e.g. 8f21ac-9c4b")
-        self.trace_input.setMinimumWidth(160)
-        toolbar.addLayout(self._field("Trace / Request ID", self.trace_input))
+        self.keyword_edits = []
+        self.keyword_container = QWidget()
+        self.keyword_container_layout = QVBoxLayout(self.keyword_container)
+        self.keyword_container_layout.setContentsMargins(0, 0, 0, 0)
+        self.keyword_container_layout.setSpacing(4)
+        self._add_keyword_row()
+        toolbar.addLayout(self._field("Keyword / Text / Trace / Request Id", self.keyword_container))
 
         self.from_input = QLineEdit()
         self.from_input.setPlaceholderText("YYYY-MM-DD HH:MM:SS")
@@ -1334,7 +1329,7 @@ class LogLensWindow(QMainWindow):
         self.source_legend_layout.setSpacing(16)
         v.addWidget(self.source_legend_row)
 
-        for w in (self.keyword_input, self.trace_input, self.from_input, self.to_input):
+        for w in (self.from_input, self.to_input):
             w.textChanged.connect(lambda _=None: self.debounce.start())
         self.case_checkbox.toggled.connect(lambda _=None: self.debounce.start())
         self.regex_checkbox.toggled.connect(lambda _=None: self.debounce.start())
@@ -1358,6 +1353,52 @@ class LogLensWindow(QMainWindow):
         col.addWidget(label)
         col.addWidget(widget)
         return col
+
+    def _add_keyword_row(self, text=""):
+        """Appends one more keyword search field. The first field always
+        carries the "+" (add another); every field after that carries a
+        "×" (remove just this one) instead — mirrors how the trace ID/date
+        filters are single fixed fields, but keyword search can have as
+        many terms as the search needs, all combined via the same AND/OR
+        selector as every other filter."""
+        row_widget = QWidget()
+        row_layout = QHBoxLayout(row_widget)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(4)
+
+        edit = QLineEdit()
+        edit.setPlaceholderText("e.g. exception, failed" if not self.keyword_edits else "another keyword…")
+        edit.setMinimumWidth(180)
+        edit.setText(text)
+        edit.textChanged.connect(lambda _=None: self.debounce.start())
+        row_layout.addWidget(edit)
+
+        btn = QPushButton()
+        btn.setFixedSize(26, 26)
+        btn.setStyleSheet(
+            f"QPushButton {{ padding: 0px; font-size: 15px; font-weight: 700; }}"
+        )
+        if not self.keyword_edits:
+            btn.setText("+")
+            btn.setToolTip("Add another keyword field")
+            btn.clicked.connect(lambda: self._add_keyword_row())
+        else:
+            btn.setText("-")
+            btn.setToolTip("Remove this keyword field")
+            btn.clicked.connect(lambda: self._remove_keyword_row(row_widget, edit))
+        row_layout.addWidget(btn)
+
+        self.keyword_container_layout.addWidget(row_widget)
+        self.keyword_edits.append(edit)
+        return edit
+
+    def _remove_keyword_row(self, row_widget, edit):
+        had_text = bool(edit.text().strip())
+        self.keyword_edits.remove(edit)
+        row_widget.setParent(None)
+        row_widget.deleteLater()
+        if had_text:
+            self.debounce.start()
 
     def _build_level_legend(self):
         row = QWidget()
@@ -1718,7 +1759,17 @@ class LogLensWindow(QMainWindow):
 
     # -- Filtering ---------------------------------------------------------
     def clear_filters(self):
-        for w in (self.keyword_input, self.trace_input, self.from_input, self.to_input):
+        # Drop every keyword row except the first (removing triggers its own
+        # re-filter via debounce; block that here since clear_filters ends
+        # with a single explicit run_filter() for the whole reset).
+        while len(self.keyword_edits) > 1:
+            edit = self.keyword_edits[-1]
+            row_widget = edit.parentWidget()
+            self.keyword_edits.remove(edit)
+            if row_widget is not None:
+                row_widget.setParent(None)
+                row_widget.deleteLater()
+        for w in (self.keyword_edits[0], self.from_input, self.to_input):
             w.blockSignals(True)
             w.setText("")
             w.blockSignals(False)
@@ -1737,8 +1788,8 @@ class LogLensWindow(QMainWindow):
         if not self.files:
             return
 
-        keyword = self.keyword_input.text().strip()
-        traceid = self.trace_input.text().strip()
+        keywords = [w.text().strip() for w in self.keyword_edits]
+        keywords = [k for k in keywords if k]
         case_sensitive = self.case_checkbox.isChecked()
         regex_mode = self.regex_checkbox.isChecked()
         from_dt = parse_datetime_field(self.from_input.text())
@@ -1746,17 +1797,21 @@ class LogLensWindow(QMainWindow):
         combine_mode = self.combine_combo.currentData()
 
         kw_re_str = None
-        if keyword:
-            pattern = keyword if regex_mode else re.escape(keyword)
+        if keywords:
             flags = 0 if case_sensitive else re.IGNORECASE
+            parts = [kw if regex_mode else re.escape(kw) for kw in keywords]
+            # One combined regex covers highlighting for every keyword field —
+            # AND vs OR only affects which *rows* survive filtering; every
+            # keyword that appears in a surviving row still gets highlighted.
+            combined_pattern = "|".join(f"(?:{p})" for p in parts)
             try:
-                kw_re_str = re.compile(pattern, flags)
+                kw_re_str = re.compile(combined_pattern, flags)
             except re.error:
                 self.status_label.setText(f'<span style="color:{DANGER}">Invalid regular expression</span>')
                 return
-        self.model.set_highlight(kw_re_str, traceid or None, case_sensitive)
+        self.model.set_highlight(kw_re_str, case_sensitive)
 
-        no_filter = not keyword and not traceid and from_dt is None and to_dt is None
+        no_filter = not keywords and from_dt is None and to_dt is None
         if no_filter:
             if self.filter_worker is not None:
                 self.filter_worker.cancel()
@@ -1780,7 +1835,7 @@ class LogLensWindow(QMainWindow):
         self.status_label.setText("Filtering… 0%")
         worker = FilterWorker(
             self.model.files, self.model.order_file, self.model.order_line, self.model.total_rows,
-            keyword, traceid, case_sensitive, regex_mode, from_dt, to_dt, combine_mode
+            keywords, case_sensitive, regex_mode, from_dt, to_dt, combine_mode
         )
         self.filter_worker = worker
         worker.progress.connect(lambda p: self.status_label.setText(f"Filtering… {p}%"))
@@ -1901,11 +1956,20 @@ class LogLensWindow(QMainWindow):
 
 
 def main():
+    # Windows groups a running app's taskbar entry (and picks its icon) by
+    # process identity, not by setWindowIcon() alone — without this, a
+    # plain `python.exe`-launched GUI app can still show python.exe's own
+    # icon in the taskbar even though the window icon is set correctly.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("LogLens.DesktopApp")
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
     app.setStyleSheet(STYLESHEET)
-    icon_path = resource_path("favicon.ico")
-    if os.path.exists(icon_path):
-        app.setWindowIcon(QIcon(icon_path))
+    app.setWindowIcon(app_icon())
     win = LogLensWindow()
     win.show()
     sys.exit(app.exec())
