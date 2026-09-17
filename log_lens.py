@@ -30,6 +30,7 @@ import sys
 import mmap
 import os
 import base64
+import json
 from array import array
 from datetime import datetime
 
@@ -43,13 +44,14 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QMenu, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QLineEdit, QPushButton, QCheckBox, QComboBox, QFileDialog, QTableView,
-    QHeaderView, QStyledItemDelegate, QStyle, QStackedWidget, QFrame, QScrollArea
+    QHeaderView, QStyledItemDelegate, QStyle, QStackedWidget, QFrame, QScrollArea,
+    QDialog, QTextEdit
 )
 
 # ---------------------------------------------------------------------------
 # Theme (mirrors the original web UI's CSS variables)
 # ---------------------------------------------------------------------------
-VERSION = "1.0.0"
+VERSION = "2.5.0"
 
 BG = "#10151c"
 PANEL = "#161d27"
@@ -66,6 +68,7 @@ LVL_ERROR = "#ff6b6b"
 LVL_WARN = "#f2d24b"
 LVL_INFO = "#5fd68a"
 LVL_DEBUG = "#8a97ab"
+JSON_COLOR = "#c9b458"   # dull/muted yellow for embedded JSON payloads
 
 KW_MARK_BG = QColor(74, 144, 226, 82)     # rgba(74,144,226,0.32)
 KW_MARK_TEXT = QColor("#eaf3ff")
@@ -209,6 +212,189 @@ LEVEL_PATTERNS = [
 ]
 LEVEL_SCAN_WINDOW = 60  # only look for the level tag near the start of the line
 METHOD_PATTERN = re.compile(r'(method\s*:\s*)(\[[^\]]+\])', re.IGNORECASE)
+
+
+# A cheap "does this actually look like JSON" signal for the fallback path
+# below: real JSON objects/arrays-of-objects are full of quoted-key colon
+# patterns; ordinary bracketed log text (thread names, trace IDs, class
+# references) never has this shape.
+JSON_KV_RE = re.compile(r'"[^"\\]{1,80}?"\s*:')
+
+
+def _quote_aware_balanced_end(text, i):
+    """From an opening '{' or '[' at `text[i]`, scans forward tracking
+    quoted strings (so a brace/bracket *inside* a properly-escaped string
+    doesn't affect the count) and returns the index just past the matching
+    close, or None if it never balances or the bracket types mismatch."""
+    stack = [text[i]]
+    j = i + 1
+    n = len(text)
+    in_string = False
+    escape = False
+    while j < n and stack:
+        cj = text[j]
+        if in_string:
+            if escape:
+                escape = False
+            elif cj == '\\':
+                escape = True
+            elif cj == '"':
+                in_string = False
+        else:
+            if cj == '"':
+                in_string = True
+            elif cj in '{[':
+                stack.append(cj)
+            elif cj in '}]':
+                top = stack.pop()
+                if (top == '{' and cj != '}') or (top == '[' and cj != ']'):
+                    return None
+        j += 1
+    return None if stack else j
+
+
+def _dumb_balanced_end(text, i):
+    """Same as above but ignores quotes entirely — pure bracket counting.
+    Used as a fallback for logs that embed a JSON structure as a *string
+    value* without escaping its inner quotes (a common real-world logging
+    bug: '"field":"[{"a":"b"}]"'), which desyncs quote-aware tracking and
+    makes it stop short of the real closing bracket. The brace/bracket
+    *symbols* themselves are still consistently balanced in that case even
+    though the quoting around them is broken, so counting them blindly
+    recovers the true outer span."""
+    stack = [text[i]]
+    j = i + 1
+    n = len(text)
+    while j < n and stack:
+        cj = text[j]
+        if cj in '{[':
+            stack.append(cj)
+        elif cj in '}]':
+            if not stack:
+                return None
+            top = stack.pop()
+            if (top == '{' and cj != '}') or (top == '[' and cj != ']'):
+                return None
+        j += 1
+    return None if stack else j
+
+
+def _is_meaningful_json(value):
+    """Rejects trivial single-scalar arrays like [null] or [210] — very
+    common in enterprise log formats as a generic "label:[value]" field
+    wrapper (e.g. "timetaken:[210]", "login id:[null]") that has nothing
+    to do with JSON, even though it happens to also be valid JSON grammar.
+    A JSON object is always meaningful; a JSON array is too, unless it's
+    exactly one bare scalar with nothing else going on."""
+    if isinstance(value, list) and len(value) == 1 and not isinstance(value[0], (dict, list)):
+        return False
+    return True
+
+
+def prettify_json_text(raw):
+    """Best-effort pretty-printing for a matched JSON span, used when the
+    user clicks on one. Strict parsing covers well-formed JSON directly;
+    for a span that find_json_spans only accepted via its lenient fallback
+    (a "field:[value]"-wrapper-mangled object — see find_json_spans'
+    docstring), a small repair pass undoes the specific double-encoding
+    pattern responsible (a nested array/object serialized as a string
+    without escaping its own quotes) so the click still produces properly
+    indented, readable output instead of just failing. Returns
+    (pretty_text, was_valid) — was_valid is False only if neither strict
+    parsing nor the repair pass could make sense of it, in which case
+    pretty_text is just the original matched text unchanged.
+    """
+    try:
+        parsed = json.loads(raw)
+        return json.dumps(parsed, indent=2, ensure_ascii=False), True
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    repaired = raw
+    for _ in range(4):
+        new_repaired = re.sub(r'":"(\[|\{)', r'":\1', repaired)
+        new_repaired = re.sub(r'(\]|\})"(?=[,}])', r'\1', new_repaired)
+        if new_repaired == repaired:
+            break
+        repaired = new_repaired
+        try:
+            parsed = json.loads(repaired)
+            return json.dumps(parsed, indent=2, ensure_ascii=False), True
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+    return raw, False
+
+
+def find_json_spans(text):
+    """Finds embedded JSON object/array literals in a log line.
+
+    Two-stage detection:
+      1. Quote-aware bracket matching + strict json.loads() validation —
+         handles well-formed JSON, including brace/bracket characters that
+         appear inside properly-escaped string values.
+      2. If that fails, a quote-agnostic bracket count + a lightweight
+         "contains quoted-key: patterns" heuristic — catches real-world
+         malformed JSON (double-encoded/unescaped nested JSON-as-a-string,
+         as seen in some service logs) that will never pass strict
+         validation but is still clearly JSON, not ordinary bracketed text.
+
+    Stage 2's heuristic is what keeps ordinary bracketed log text — a
+    thread name '[http-nio-0.0.0-8881-exec-15]', a trace ID
+    '[dd0f65d3377a9f326f9446829baecfbd]', a class reference
+    '[com.foo.Bar@76f8621]' — from being mistaken for JSON: none of those
+    contain a quoted-key: pattern, so they're rejected by both stages.
+    """
+    spans = []
+    n = len(text)
+    i = 0
+    while i < n:
+        c = text[i]
+        if c in '{[':
+            accepted_end = None
+
+            qa_end = _quote_aware_balanced_end(text, i)
+            if qa_end is not None:
+                try:
+                    parsed = json.loads(text[i:qa_end])
+                    if _is_meaningful_json(parsed):
+                        accepted_end = qa_end
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+            # The lenient fallback only applies to '{' (object) starts, not
+            # '['. Enterprise log formats very often use '[' as a generic
+            # "label:[value]" field wrapper that has nothing to do with
+            # JSON — e.g. "values:[{...}], timetaken:[210] ms" — and that
+            # wrapper is itself balanced-bracket-shaped and would contain
+            # a real object's "key": patterns inside it, so the same
+            # heuristic that correctly rescues a malformed {...} object
+            # would also wrongly swallow the surrounding non-JSON [...]
+            # wrapper if applied here too. Restricting to '{' means the
+            # scan naturally continues past a wrapper like that and picks
+            # out just the actual object inside it.
+            #
+            # It's also skipped when the very next character is itself an
+            # opening bracket ('{{...}}' or '{[...]}' at the very start).
+            # Genuine nested JSON always has a quoted key in between, e.g.
+            # {"key":{...}} — back-to-back opening brackets with nothing
+            # between them is a sign of a spurious extra wrapping layer
+            # (e.g. a dropped map key in a toString()-style dump), and the
+            # inner {...} is typically already valid JSON on its own; not
+            # attempting the fallback here lets the scan reach that inner
+            # object and pick it up cleanly via strict parsing instead of
+            # swallowing the invalid outer layer along with it.
+            if accepted_end is None and c == '{' and (i + 1 >= n or text[i + 1] not in '{['):
+                dumb_end = _dumb_balanced_end(text, i)
+                if dumb_end is not None and JSON_KV_RE.search(text[i:dumb_end]):
+                    accepted_end = dumb_end
+
+            if accepted_end is not None and accepted_end > i + 1:
+                spans.append((i, accepted_end))
+                i = accepted_end
+                continue
+        i += 1
+    return spans
 
 
 def extract_timestamp(text: str):
@@ -750,7 +936,8 @@ class LogTableModel(QAbstractTableModel):
         return spans
 
     def _fg_spans(self, text):
-        """Foreground color spans: the log-level word and any method:[name]."""
+        """Foreground color spans: the log-level word, any method:[name],
+        and any embedded JSON object/array."""
         spans = []
         window = text[:LEVEL_SCAN_WINDOW]
         for _level, color, pattern in LEVEL_PATTERNS:
@@ -760,6 +947,8 @@ class LogTableModel(QAbstractTableModel):
                 break
         for m in METHOD_PATTERN.finditer(text):
             spans.append((m.start(2), m.end(2), ACCENT_2))
+        for s, e in find_json_spans(text):
+            spans.append((s, e, JSON_COLOR))
         spans.sort(key=lambda s: s[0])
         return spans
 
@@ -1069,6 +1258,8 @@ class LogTableView(QTableView):
     the browser version of this tool.
     """
 
+    json_clicked = Signal(str)  # emitted with the exact matched JSON span text
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.line_delegate = None
@@ -1079,6 +1270,19 @@ class LogTableView(QTableView):
 
     def set_line_delegate(self, delegate):
         self.line_delegate = delegate
+
+    def _json_span_at(self, row, offset):
+        """The matched JSON text at (row, char_offset), or None — used to
+        tell a plain click on a highlighted JSON span apart from a click
+        anywhere else in the text column."""
+        model = self.model()
+        if model is None or row < 0 or row >= model.rowCount():
+            return None
+        text = model.index(row, 2).data(Qt.DisplayRole) or ""
+        for s, e in find_json_spans(text):
+            if s <= offset < e:
+                return text[s:e]
+        return None
 
     # -- Hit testing --------------------------------------------------
     def _hit_test(self, pos: QPoint):
@@ -1156,6 +1360,16 @@ class LogTableView(QTableView):
     def mouseReleaseEvent(self, event):
         if self._dragging_text:
             self._dragging_text = False
+            # anchor == end means the mouse never moved to a different
+            # character during the press — a plain click, not a
+            # click-drag selection. Only then does landing on a JSON span
+            # open the pretty-print dialog, so dragging to select JSON
+            # text (e.g. to copy it) still works exactly as before.
+            if self.text_sel_anchor is not None and self.text_sel_anchor == self.text_sel_end:
+                row, offset = self.text_sel_anchor
+                span_text = self._json_span_at(row, offset)
+                if span_text:
+                    self.json_clicked.emit(span_text)
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -1722,6 +1936,7 @@ class LogLensWindow(QMainWindow):
         # one hook covers every case where a previously-selected row's text
         # could no longer exist or now mean something different.
         self.model.modelReset.connect(self.table.clear_text_selection)
+        self.table.json_clicked.connect(self._show_json_dialog)
         self.source_delegate = SourceBadgeDelegate(self.model)
         self.lineno_delegate = LineNoDelegate()
         self.line_delegate = LogLineDelegate(self.model)
@@ -2210,6 +2425,68 @@ class LogLensWindow(QMainWindow):
             self.filter_expr_label.setVisible(False)
 
     # -- Copy ------------------------------------------------------------
+    # -- JSON pretty-print dialog -----------------------------------------
+    def _show_json_dialog(self, raw_text):
+        pretty, was_valid = prettify_json_text(raw_text)
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("JSON" if was_valid else "JSON (best-effort formatting)")
+        dialog.resize(720, 560)
+        dialog.setStyleSheet(f"QDialog {{ background: {BG}; }}")
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        if not was_valid:
+            warning = QLabel(
+                "Couldn't fully parse this as strict JSON (likely unescaped nested "
+                "quotes in the source log) — Prettify falls back to the original text."
+            )
+            warning.setWordWrap(True)
+            warning.setStyleSheet(f"color:{LVL_WARN}; font-size:11px;")
+            layout.addWidget(warning)
+
+        view = QTextEdit()
+        view.setReadOnly(True)
+        view.setFont(QFont("Consolas", 10))
+        view.setStyleSheet(
+            f"QTextEdit {{ background:{PANEL}; color:{TEXT}; border:1px solid {LINE}; "
+            f"selection-background-color:{ACCENT_2}; }}"
+        )
+        layout.addWidget(view, 1)
+
+        # Starts on the prettified view (when parsing succeeded); the toggle
+        # switches to the exact original matched text and back, so you can
+        # get at either form — formatted for reading, raw for an exact copy.
+        state = {"showing_pretty": was_valid}
+
+        def render():
+            view.setPlainText(pretty if state["showing_pretty"] else raw_text)
+            toggle_btn.setText("Show Raw" if state["showing_pretty"] else "Prettify")
+
+        def toggle():
+            state["showing_pretty"] = not state["showing_pretty"]
+            render()
+
+        btn_row = QHBoxLayout()
+        toggle_btn = QPushButton()
+        toggle_btn.clicked.connect(toggle)
+        btn_row.addWidget(toggle_btn)
+        btn_row.addStretch(1)
+        copy_btn = QPushButton("Copy")
+        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(view.toPlainText()))
+        close_btn = QPushButton("Close")
+        close_btn.setObjectName("primary")
+        close_btn.clicked.connect(dialog.accept)
+        btn_row.addWidget(copy_btn)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+        render()
+
+        dialog.exec()
+
     def copy_selected_rows(self):
         if not self.files:
             return
