@@ -43,12 +43,14 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QMenu, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QLineEdit, QPushButton, QCheckBox, QComboBox, QFileDialog, QTableView,
-    QHeaderView, QStyledItemDelegate, QStyle, QStackedWidget, QFrame
+    QHeaderView, QStyledItemDelegate, QStyle, QStackedWidget, QFrame, QScrollArea
 )
 
 # ---------------------------------------------------------------------------
 # Theme (mirrors the original web UI's CSS variables)
 # ---------------------------------------------------------------------------
+VERSION = "1.0.0"
+
 BG = "#10151c"
 PANEL = "#161d27"
 PANEL_2 = "#1c2430"
@@ -121,6 +123,16 @@ QComboBox QAbstractItemView {{
 }}
 QLineEdit:focus, QComboBox:focus {{
     border: 1px solid {ACCENT_2};
+}}
+QFrame#kwGroup {{
+    border: 1px solid {LINE};
+    border-radius: 6px;
+    background: {PANEL};
+}}
+QFrame#kwSubgroup {{
+    border: 1px solid {ACCENT_2};
+    border-radius: 6px;
+    background: {PANEL_2};
 }}
 QPushButton {{
     font-family: {FONT_FAMILY};
@@ -448,13 +460,14 @@ class FilterWorker(QThread):
     failed = Signal(str)
 
     def __init__(self, files, order_file, order_line, total_rows,
-                 keywords, case_sensitive, regex_mode, from_dt, to_dt, combine_mode):
+                 keyword_groups, case_sensitive, regex_mode, from_dt, to_dt, combine_mode):
         super().__init__()
         self.files = files
         self.order_file = order_file  # None => single-file direct mode (row == line_no in files[0])
         self.order_line = order_line
         self.total_rows = total_rows
-        self.keywords = keywords  # list[str], already stripped of blanks by the caller
+        # list[{'mode': 'and'|'or', 'terms': list[str], 'subgroups': [{'mode','terms'}, ...]}]
+        self.keyword_groups = keyword_groups
         self.case_sensitive = case_sensitive
         self.regex_mode = regex_mode
         self.from_dt = from_dt
@@ -471,18 +484,35 @@ class FilterWorker(QThread):
         # lookups in favor of local variables — at tens of millions of
         # iterations that difference is the gap between ~45s and ~120s.
         try:
-            kw_searches = []
-            if self.keywords:
-                flags = 0 if self.case_sensitive else re.IGNORECASE
-                for kw in self.keywords:
+            # Three levels of boolean logic:
+            #   outer (combine_or, between groups)
+            #     -> group (its own AND/OR, between its direct terms + subgroup results)
+            #          -> subgroup (its own AND/OR, between its own terms)
+            # e.g. ((A OR B) AND C) OR D:
+            #   group1 = mode AND, terms [C], subgroups [{mode: or, terms: [A, B]}]
+            #   group2 = terms [D]
+            #   combine_mode = or
+            def compile_terms(terms, flags):
+                fns = []
+                for kw in terms:
                     pattern = kw if self.regex_mode else re.escape(kw)
-                    try:
-                        kw_searches.append(
-                            re.compile(pattern.encode('utf-8', 'surrogateescape'), flags).search
-                        )
-                    except re.error as e:
-                        self.failed.emit(f"Invalid regular expression ({kw!r}): {e}")
-                        return
+                    fns.append(re.compile(pattern.encode('utf-8', 'surrogateescape'), flags).search)
+                return fns
+
+            compiled_groups = []
+            if self.keyword_groups:
+                flags = 0 if self.case_sensitive else re.IGNORECASE
+                try:
+                    for g in self.keyword_groups:
+                        term_fns = compile_terms(g["terms"], flags)
+                        sub_compiled = [
+                            (compile_terms(sg["terms"], flags), sg["mode"] == 'or')
+                            for sg in g["subgroups"]
+                        ]
+                        compiled_groups.append((term_fns, sub_compiled, g["mode"] == 'or'))
+                except re.error as e:
+                    self.failed.emit(f"Invalid regular expression: {e}")
+                    return
 
             case_sensitive = self.case_sensitive
             combine_or = self.combine_or
@@ -501,9 +531,14 @@ class FilterWorker(QThread):
             def line_matches(raw):
                 active = 0
                 passed = 0
-                for kw_search in kw_searches:
+                for term_fns, sub_compiled, group_is_or in compiled_groups:
                     active += 1
-                    if kw_search(raw) is not None:
+                    child_results = [fn(raw) is not None for fn in term_fns]
+                    for sub_fns, sub_is_or in sub_compiled:
+                        sub_results = [fn(raw) is not None for fn in sub_fns]
+                        child_results.append(any(sub_results) if sub_is_or else all(sub_results))
+                    group_pass = any(child_results) if group_is_or else all(child_results)
+                    if group_pass:
                         passed += 1
                 if date_active:
                     active += 1
@@ -1187,7 +1222,7 @@ class LogTableView(QTableView):
 class LogLensWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Log Lens")
+        self.setWindowTitle(f"Log Lens v{VERSION}")
         self.resize(1320, 820)
         self.setAcceptDrops(True)
         self.setWindowIcon(app_icon())
@@ -1248,11 +1283,14 @@ class LogLensWindow(QMainWindow):
         dot.setFixedSize(8, 8)
         title = QLabel("Log Lens")
         title.setObjectName("titleLabel")
+        version_label = QLabel(f"v{VERSION}")
+        version_label.setStyleSheet(f"color:{TEXT_DIM}; font-size:10px;")
         self.filename_label = QLabel("")
         self.filename_label.setObjectName("filenameLabel")
         self.filename_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         title_row.addWidget(dot)
         title_row.addWidget(title)
+        title_row.addWidget(version_label)
         title_row.addStretch(1)
         title_row.addWidget(self.filename_label)
         v.addLayout(title_row)
@@ -1270,13 +1308,46 @@ class LogLensWindow(QMainWindow):
         self.remove_all_btn.clicked.connect(self.remove_all_files)
         toolbar.addLayout(self._field("", self.remove_all_btn))
 
-        self.keyword_edits = []
-        self.keyword_container = QWidget()
-        self.keyword_container_layout = QVBoxLayout(self.keyword_container)
-        self.keyword_container_layout.setContentsMargins(0, 0, 0, 0)
-        self.keyword_container_layout.setSpacing(4)
-        self._add_keyword_row()
-        toolbar.addLayout(self._field("Keyword / Text / Trace / Request Id", self.keyword_container))
+        self.keyword_groups = []  # list of dicts: {frame, body_layout, terms, subgroups, combo, remove_btn}
+        self.keyword_groups_container = QWidget()
+        self.keyword_groups_layout = QHBoxLayout(self.keyword_groups_container)
+        self.keyword_groups_layout.setContentsMargins(0, 0, 0, 0)
+        self.keyword_groups_layout.setSpacing(6)
+        # Groups pack left-to-right; this trailing stretch keeps them from
+        # being stretched to fill extra width, and new groups are inserted
+        # before it (see _add_keyword_group) so it always stays last.
+        self.keyword_groups_layout.addStretch(1)
+
+        # Side-by-side groups mean the only dimension that can grow with a
+        # complex expression is width, not height — so this scrolls
+        # horizontally within a fixed height instead of vertically. A single
+        # very tall group (many terms/subgroups stacked inside it) still
+        # gets a vertical scrollbar as a fallback.
+        kw_scroll = QScrollArea()
+        kw_scroll.setWidget(self.keyword_groups_container)
+        kw_scroll.setWidgetResizable(True)
+        kw_scroll.setFixedHeight(150)
+        kw_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        kw_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        kw_scroll.setFrameShape(QFrame.NoFrame)
+        kw_scroll.setStyleSheet(f"QScrollArea {{ background: transparent; border: none; }}")
+
+        self.keyword_field_widget = QWidget()
+        kw_field_layout = QVBoxLayout(self.keyword_field_widget)
+        kw_field_layout.setContentsMargins(0, 0, 0, 0)
+        kw_field_layout.setSpacing(4)
+        kw_field_layout.addWidget(kw_scroll)
+
+        add_group_btn = QPushButton("+ Group")
+        add_group_btn.setToolTip(
+            "Add another group, e.g. (text1 OR text2) AND text3 — set the first "
+            "group to OR, add a second group with text3, then set \"Combine "
+            "filters\" below to Match ALL (AND)."
+        )
+        add_group_btn.clicked.connect(lambda: self._add_keyword_group())
+        kw_field_layout.addWidget(add_group_btn, alignment=Qt.AlignLeft)
+
+        self._add_keyword_group()
 
         self.from_input = QLineEdit()
         self.from_input.setPlaceholderText("YYYY-MM-DD HH:MM:SS")
@@ -1305,11 +1376,6 @@ class LogLensWindow(QMainWindow):
         checkbox_row_layout.addWidget(self.wrap_checkbox)
         toolbar.addLayout(self._field("", checkbox_row))
 
-        self.combine_combo = QComboBox()
-        self.combine_combo.addItem("Match ALL (AND)", "and")
-        self.combine_combo.addItem("Match ANY (OR)", "or")
-        toolbar.addLayout(self._field("Combine filters", self.combine_combo))
-
         self.clear_btn = QPushButton("Clear filters")
         self.clear_btn.clicked.connect(self.clear_filters)
         toolbar.addLayout(self._field("", self.clear_btn))
@@ -1320,7 +1386,42 @@ class LogLensWindow(QMainWindow):
         toolbar.addLayout(self._field("", self.export_btn))
 
         toolbar.addStretch(1)
+        for i in range(toolbar.count()):
+            item = toolbar.itemAt(i)
+            if item.layout() is not None:
+                toolbar.setAlignment(item.layout(), Qt.AlignTop)
         v.addLayout(toolbar)
+
+        # Row 2: the keyword/text/trace search groups get their own row so
+        # they never fight the rest of the toolbar for space — and a
+        # minimize toggle lets it be collapsed down to just this header
+        # when you're not actively building a search expression.
+        kw_row = QVBoxLayout()
+        kw_row.setSpacing(4)
+
+        kw_header = QHBoxLayout()
+        kw_header.setContentsMargins(0, 0, 0, 0)
+        kw_header.setSpacing(6)
+        kw_label = QLabel("Keyword / Text / Trace / Request Id")
+        kw_label.setStyleSheet(f"color:{TEXT_DIM}; font-size:10px;")
+        kw_header.addWidget(kw_label)
+        self.kw_minimize_btn = QPushButton("▾ Minimize")
+        self.kw_minimize_btn.setStyleSheet("QPushButton { padding: 3px 8px; font-size: 11px; }")
+        self.kw_minimize_btn.setToolTip("Collapse/expand the keyword search row")
+        self.kw_minimize_btn.clicked.connect(self._toggle_keyword_row)
+        kw_header.addWidget(self.kw_minimize_btn)
+        kw_header.addSpacing(12)
+        combine_label = QLabel("Combine filters")
+        combine_label.setStyleSheet(f"color:{TEXT_DIM}; font-size:10px;")
+        kw_header.addWidget(combine_label)
+        self.combine_combo = QComboBox()
+        self.combine_combo.addItem("Match ALL (AND)", "and")
+        self.combine_combo.addItem("Match ANY (OR)", "or")
+        kw_header.addWidget(self.combine_combo)
+        kw_header.addStretch(1)
+        kw_row.addLayout(kw_header)
+        kw_row.addWidget(self.keyword_field_widget)
+        v.addLayout(kw_row)
 
         v.addWidget(self._build_level_legend())
         self.source_legend_row = QWidget()
@@ -1354,49 +1455,186 @@ class LogLensWindow(QMainWindow):
         col.addWidget(widget)
         return col
 
-    def _add_keyword_row(self, text=""):
-        """Appends one more keyword search field. The first field always
-        carries the "+" (add another); every field after that carries a
-        "×" (remove just this one) instead — mirrors how the trace ID/date
-        filters are single fixed fields, but keyword search can have as
-        many terms as the search needs, all combined via the same AND/OR
-        selector as every other filter."""
+    def _toggle_keyword_row(self):
+        now_visible = not self.keyword_field_widget.isVisible()
+        self.keyword_field_widget.setVisible(now_visible)
+        self.kw_minimize_btn.setText("▾ Minimize" if now_visible else "▸ Expand")
+
+    def _add_keyword_group(self):
+        """Adds a new top-level keyword group — a bordered box whose own
+        AND/OR mode combines everything directly inside it: plain terms,
+        AND/OR one nested subgroup for one extra level of parenthesization.
+        Top-level groups themselves are combined by the "Combine filters"
+        dropdown. Together this gives three levels of boolean logic — e.g.
+        to build ((A OR B) AND C) OR D:
+          - Group 1: mode AND, containing a term C plus a subgroup [A, B]
+            set to OR  →  (A OR B) AND C
+          - Group 2: containing a term D
+          - "Combine filters" set to Match ANY (OR)  →  (…) OR D
+        """
+        frame = QFrame()
+        frame.setObjectName("kwGroup")
+        outer = QVBoxLayout(frame)
+        outer.setContentsMargins(6, 6, 6, 6)
+        outer.setSpacing(4)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(4)
+        combo = QComboBox()
+        combo.addItem("Match ANY here (OR)", "or")
+        combo.addItem("Match ALL here (AND)", "and")
+        combo.currentIndexChanged.connect(lambda _=None: self.debounce.start())
+        header.addWidget(combo)
+        header.addStretch(1)
+        remove_group_btn = QPushButton("×")
+        remove_group_btn.setFixedSize(20, 20)
+        remove_group_btn.setStyleSheet("QPushButton { padding: 0px; font-size: 13px; }")
+        remove_group_btn.setToolTip("Remove this whole group")
+        header.addWidget(remove_group_btn)
+        outer.addLayout(header)
+
+        body_layout = QHBoxLayout()
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        body_layout.setSpacing(4)
+        body_layout.addStretch(1)
+        outer.addLayout(body_layout)
+
+        footer = QHBoxLayout()
+        footer.setContentsMargins(0, 0, 0, 0)
+        footer.setSpacing(4)
+        add_term_btn = QPushButton("+ Term")
+        add_term_btn.setToolTip("Add another term directly in this group")
+        footer.addWidget(add_term_btn)
+        add_sub_btn = QPushButton("+ Subgroup")
+        add_sub_btn.setToolTip("Add a nested (…) subgroup inside this group")
+        footer.addWidget(add_sub_btn)
+        footer.addStretch(1)
+        outer.addLayout(footer)
+
+        group = {"frame": frame, "body_layout": body_layout, "combo": combo,
+                 "terms": [], "subgroups": [], "remove_btn": remove_group_btn}
+        remove_group_btn.clicked.connect(lambda: self._remove_keyword_group(group))
+        add_term_btn.clicked.connect(lambda: self._add_term(group))
+        add_sub_btn.clicked.connect(lambda: self._add_subgroup(group))
+
+        self.keyword_groups.append(group)
+        self._add_term(group)  # every group starts with one usable term
+
+        self.keyword_groups_layout.insertWidget(self.keyword_groups_layout.count() - 1, frame)
+        self._update_group_remove_buttons()
+        return group
+
+    def _remove_keyword_group(self, group):
+        if len(self.keyword_groups) <= 1:
+            return  # always keep at least one top-level group
+        had_text = self._group_has_text(group)
+        self.keyword_groups.remove(group)
+        group["frame"].setParent(None)
+        group["frame"].deleteLater()
+        self._update_group_remove_buttons()
+        if had_text:
+            self.debounce.start()
+
+    def _update_group_remove_buttons(self):
+        # Only allow removing a top-level group down to a minimum of one.
+        only_one = len(self.keyword_groups) == 1
+        for g in self.keyword_groups:
+            g["remove_btn"].setVisible(not only_one)
+
+    def _group_has_text(self, group):
+        if any(e.text().strip() for e in group["terms"]):
+            return True
+        return any(e.text().strip() for sg in group["subgroups"] for e in sg["terms"])
+
+    # -- Plain terms, directly inside a group or inside a subgroup --------
+    def _add_term(self, container, text=""):
+        """Adds one term row inside `container`, which is either a
+        top-level group dict or a subgroup dict — both have "terms" (list)
+        and "body_layout" (where the row is inserted)."""
         row_widget = QWidget()
         row_layout = QHBoxLayout(row_widget)
         row_layout.setContentsMargins(0, 0, 0, 0)
         row_layout.setSpacing(4)
 
         edit = QLineEdit()
-        edit.setPlaceholderText("e.g. exception, failed" if not self.keyword_edits else "another keyword…")
-        edit.setMinimumWidth(180)
+        edit.setPlaceholderText("e.g. exception, failed" if not container["terms"] else "another term…")
+        edit.setMinimumWidth(160)
         edit.setText(text)
         edit.textChanged.connect(lambda _=None: self.debounce.start())
         row_layout.addWidget(edit)
 
-        btn = QPushButton()
-        btn.setFixedSize(26, 26)
-        btn.setStyleSheet(
-            f"QPushButton {{ padding: 0px; font-size: 15px; font-weight: 700; }}"
-        )
-        if not self.keyword_edits:
-            btn.setText("+")
-            btn.setToolTip("Add another keyword field")
-            btn.clicked.connect(lambda: self._add_keyword_row())
-        else:
-            btn.setText("-")
-            btn.setToolTip("Remove this keyword field")
-            btn.clicked.connect(lambda: self._remove_keyword_row(row_widget, edit))
-        row_layout.addWidget(btn)
+        remove_btn = QPushButton("-")
+        remove_btn.setFixedSize(26, 26)
+        remove_btn.setStyleSheet("QPushButton { padding: 0px; font-size: 15px; font-weight: 700; }")
+        remove_btn.setToolTip("Remove this term")
+        remove_btn.clicked.connect(lambda: self._remove_term(container, row_widget, edit))
+        row_layout.addWidget(remove_btn)
 
-        self.keyword_container_layout.addWidget(row_widget)
-        self.keyword_edits.append(edit)
+        container["body_layout"].insertWidget(container["body_layout"].count() - 1, row_widget)
+        container["terms"].append(edit)
         return edit
 
-    def _remove_keyword_row(self, row_widget, edit):
+    def _remove_term(self, container, row_widget, edit):
         had_text = bool(edit.text().strip())
-        self.keyword_edits.remove(edit)
+        container["terms"].remove(edit)
         row_widget.setParent(None)
         row_widget.deleteLater()
+        if had_text:
+            self.debounce.start()
+
+    # -- Subgroups: one extra level of (…) nesting inside a group ---------
+    def _add_subgroup(self, group):
+        frame = QFrame()
+        frame.setObjectName("kwSubgroup")
+        outer = QVBoxLayout(frame)
+        outer.setContentsMargins(6, 6, 6, 6)
+        outer.setSpacing(4)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(4)
+        combo = QComboBox()
+        combo.addItem("Match ANY here (OR)", "or")
+        combo.addItem("Match ALL here (AND)", "and")
+        combo.currentIndexChanged.connect(lambda _=None: self.debounce.start())
+        header.addWidget(combo)
+        header.addStretch(1)
+        remove_btn = QPushButton("×")
+        remove_btn.setFixedSize(20, 20)
+        remove_btn.setStyleSheet("QPushButton { padding: 0px; font-size: 13px; }")
+        remove_btn.setToolTip("Remove this subgroup")
+        header.addWidget(remove_btn)
+        outer.addLayout(header)
+
+        body_layout = QHBoxLayout()
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        body_layout.setSpacing(4)
+        body_layout.addStretch(1)
+        outer.addLayout(body_layout)
+
+        add_term_btn = QPushButton("+ Term")
+        add_term_btn.setToolTip("Add another term in this subgroup")
+        term_footer = QHBoxLayout()
+        term_footer.setContentsMargins(0, 0, 0, 0)
+        term_footer.addWidget(add_term_btn)
+        term_footer.addStretch(1)
+        outer.addLayout(term_footer)
+
+        subgroup = {"frame": frame, "body_layout": body_layout, "combo": combo, "terms": []}
+        remove_btn.clicked.connect(lambda: self._remove_subgroup(group, subgroup))
+        add_term_btn.clicked.connect(lambda: self._add_term(subgroup))
+
+        group["subgroups"].append(subgroup)
+        self._add_term(subgroup)  # subgroup starts with one usable term
+        group["body_layout"].insertWidget(group["body_layout"].count() - 1, frame)
+        return subgroup
+
+    def _remove_subgroup(self, group, subgroup):
+        had_text = any(e.text().strip() for e in subgroup["terms"])
+        group["subgroups"].remove(subgroup)
+        subgroup["frame"].setParent(None)
+        subgroup["frame"].deleteLater()
         if had_text:
             self.debounce.start()
 
@@ -1432,12 +1670,27 @@ class LogLensWindow(QMainWindow):
     def _build_statusbar(self):
         bar = QFrame()
         bar.setObjectName("statusbar")
-        h = QHBoxLayout(bar)
-        h.setContentsMargins(18, 6, 18, 6)
-        h.setSpacing(16)
+        outer = QVBoxLayout(bar)
+        outer.setContentsMargins(18, 6, 18, 6)
+        outer.setSpacing(2)
+
+        row1 = QHBoxLayout()
+        row1.setContentsMargins(0, 0, 0, 0)
+        row1.setSpacing(16)
         self.status_label = QLabel("No file loaded")
-        h.addWidget(self.status_label)
-        h.addStretch(1)
+        row1.addWidget(self.status_label)
+        row1.addStretch(1)
+        outer.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.setContentsMargins(0, 0, 0, 0)
+        row2.setSpacing(16)
+        self.filter_expr_label = QLabel("")
+        self.filter_expr_label.setVisible(False)
+        row2.addWidget(self.filter_expr_label)
+        row2.addStretch(1)
+        outer.addLayout(row2)
+
         return bar
 
     def _build_empty_state(self):
@@ -1756,20 +2009,37 @@ class LogLensWindow(QMainWindow):
         self.model.set_files([], None, None, 0)
         self._after_files_changed()
         self.status_label.setText("No file loaded")
-
-    # -- Filtering ---------------------------------------------------------
+        self.filter_expr_label.setVisible(False)
     def clear_filters(self):
-        # Drop every keyword row except the first (removing triggers its own
-        # re-filter via debounce; block that here since clear_filters ends
-        # with a single explicit run_filter() for the whole reset).
-        while len(self.keyword_edits) > 1:
-            edit = self.keyword_edits[-1]
+        # Collapse down to a single group with a single empty term and no
+        # subgroups — removing extras here directly (not via
+        # _remove_keyword_group / _remove_subgroup / _remove_term) since
+        # those trigger their own re-filter via debounce, and clear_filters
+        # ends with one explicit run_filter() for the whole reset.
+        while len(self.keyword_groups) > 1:
+            group = self.keyword_groups.pop()
+            group["frame"].setParent(None)
+            group["frame"].deleteLater()
+        group0 = self.keyword_groups[0]
+        for sg in list(group0["subgroups"]):
+            group0["subgroups"].remove(sg)
+            sg["frame"].setParent(None)
+            sg["frame"].deleteLater()
+        while len(group0["terms"]) > 1:
+            edit = group0["terms"].pop()
             row_widget = edit.parentWidget()
-            self.keyword_edits.remove(edit)
             if row_widget is not None:
                 row_widget.setParent(None)
                 row_widget.deleteLater()
-        for w in (self.keyword_edits[0], self.from_input, self.to_input):
+        group0["terms"][0].blockSignals(True)
+        group0["terms"][0].setText("")
+        group0["terms"][0].blockSignals(False)
+        group0["combo"].blockSignals(True)
+        group0["combo"].setCurrentIndex(0)
+        group0["combo"].blockSignals(False)
+        self._update_group_remove_buttons()
+
+        for w in (self.from_input, self.to_input):
             w.blockSignals(True)
             w.setText("")
             w.blockSignals(False)
@@ -1788,8 +2058,25 @@ class LogLensWindow(QMainWindow):
         if not self.files:
             return
 
-        keywords = [w.text().strip() for w in self.keyword_edits]
-        keywords = [k for k in keywords if k]
+        # Each top-level group becomes {'mode', 'terms', 'subgroups'}, where
+        # subgroups is itself a list of {'mode', 'terms'} — one extra level
+        # of (…) nesting. Groups/subgroups with no non-blank terms anywhere
+        # inside them are dropped so they don't count as an active filter
+        # unit at the outer AND/OR level.
+        kw_groups = []
+        all_terms = []
+        for g in self.keyword_groups:
+            terms = [t for t in (e.text().strip() for e in g["terms"]) if t]
+            subgroups = []
+            for sg in g["subgroups"]:
+                sg_terms = [t for t in (e.text().strip() for e in sg["terms"]) if t]
+                if sg_terms:
+                    subgroups.append({"mode": sg["combo"].currentData(), "terms": sg_terms})
+                    all_terms.extend(sg_terms)
+            if terms or subgroups:
+                kw_groups.append({"mode": g["combo"].currentData(), "terms": terms, "subgroups": subgroups})
+                all_terms.extend(terms)
+
         case_sensitive = self.case_checkbox.isChecked()
         regex_mode = self.regex_checkbox.isChecked()
         from_dt = parse_datetime_field(self.from_input.text())
@@ -1797,12 +2084,13 @@ class LogLensWindow(QMainWindow):
         combine_mode = self.combine_combo.currentData()
 
         kw_re_str = None
-        if keywords:
+        if all_terms:
             flags = 0 if case_sensitive else re.IGNORECASE
-            parts = [kw if regex_mode else re.escape(kw) for kw in keywords]
-            # One combined regex covers highlighting for every keyword field —
-            # AND vs OR only affects which *rows* survive filtering; every
-            # keyword that appears in a surviving row still gets highlighted.
+            parts = [t if regex_mode else re.escape(t) for t in all_terms]
+            # One combined regex covers highlighting for every term in every
+            # group — grouping/AND/OR only affects which *rows* survive
+            # filtering; every term that appears in a surviving row still
+            # gets highlighted, regardless of which group it came from.
             combined_pattern = "|".join(f"(?:{p})" for p in parts)
             try:
                 kw_re_str = re.compile(combined_pattern, flags)
@@ -1811,7 +2099,7 @@ class LogLensWindow(QMainWindow):
                 return
         self.model.set_highlight(kw_re_str, case_sensitive)
 
-        no_filter = not keywords and from_dt is None and to_dt is None
+        no_filter = not kw_groups and from_dt is None and to_dt is None
         if no_filter:
             if self.filter_worker is not None:
                 self.filter_worker.cancel()
@@ -1835,7 +2123,7 @@ class LogLensWindow(QMainWindow):
         self.status_label.setText("Filtering… 0%")
         worker = FilterWorker(
             self.model.files, self.model.order_file, self.model.order_line, self.model.total_rows,
-            keywords, case_sensitive, regex_mode, from_dt, to_dt, combine_mode
+            kw_groups, case_sensitive, regex_mode, from_dt, to_dt, combine_mode
         )
         self.filter_worker = worker
         worker.progress.connect(lambda p: self.status_label.setText(f"Filtering… {p}%"))
@@ -1857,9 +2145,47 @@ class LogLensWindow(QMainWindow):
         self.export_btn.setEnabled(True)
         self.status_label.setText(f'<span style="color:{DANGER}">{message}</span>')
 
+    def _describe_container(self, container, wrap):
+        """Renders one group or subgroup as text, e.g. 'A OR B'. Subgroup
+        text is always parenthesized when it has 2+ parts (it's always
+        nested inside something else); a top-level group is only
+        parenthesized when `wrap` is True, which build_filter_expression
+        sets based on whether there's more than one top-level group — so a
+        single group renders as "(A OR B) AND C" rather than the
+        technically-equivalent but noisier "((A OR B) AND C)"."""
+        parts = []
+        for sg in container.get("subgroups", []):
+            sg_terms = [t for t in (e.text().strip() for e in sg["terms"]) if t]
+            if sg_terms:
+                parts.append(self._describe_container(sg, wrap=True))
+        parts.extend(t for t in (e.text().strip() for e in container["terms"]) if t)
+        if not parts:
+            return None
+        mode_str = " OR " if container["combo"].currentData() == "or" else " AND "
+        if len(parts) == 1:
+            return parts[0]
+        joined = mode_str.join(parts)
+        return f"({joined})" if wrap else joined
+
+    def build_filter_expression(self):
+        """Human-readable form of the active keyword filter, e.g.
+        '(A OR B) AND C' or '((A OR B) AND C) OR D' — shown in the status
+        line so the boolean logic that's actually being applied is visible
+        at a glance instead of something you have to reason through."""
+        multi = len(self.keyword_groups) > 1
+        group_exprs = [self._describe_container(g, wrap=multi) for g in self.keyword_groups]
+        group_exprs = [e for e in group_exprs if e]
+        if not group_exprs:
+            return None
+        if len(group_exprs) == 1:
+            return group_exprs[0]
+        mode_str = " OR " if self.combine_combo.currentData() == "or" else " AND "
+        return mode_str.join(group_exprs)
+
     def update_status(self):
         if not self.files:
             self.status_label.setText("No file loaded")
+            self.filter_expr_label.setVisible(False)
             return
         if len(self.files) == 1:
             current_name = self.files[0].name
@@ -1875,6 +2201,13 @@ class LogLensWindow(QMainWindow):
         else:
             parts.append("Showing all lines")
         self.status_label.setText("&nbsp;&nbsp;&nbsp;".join(parts))
+
+        expr = self.build_filter_expression()
+        if expr:
+            self.filter_expr_label.setText(f'Filter: <b style="color:{ACCENT}">{expr}</b>')
+            self.filter_expr_label.setVisible(True)
+        else:
+            self.filter_expr_label.setVisible(False)
 
     # -- Copy ------------------------------------------------------------
     def copy_selected_rows(self):
