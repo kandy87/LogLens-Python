@@ -714,7 +714,7 @@ class FilterWorker(QThread):
 
             file_mms = [(lf._mm, lf.offsets, lf.file_size) for lf in self.files]
 
-            def line_matches(raw):
+            def line_matches(raw, ts):
                 active = 0
                 passed = 0
                 for term_fns, sub_compiled, group_is_or in compiled_groups:
@@ -728,7 +728,6 @@ class FilterWorker(QThread):
                         passed += 1
                 if date_active:
                     active += 1
-                    ts = extract_fast(raw)
                     ok = ts is not None
                     if ok and from_dt and ts < from_dt:
                         ok = False
@@ -743,25 +742,48 @@ class FilterWorker(QThread):
             matches = array('i')
             last_percent = -1
 
+            # A line with no parseable timestamp (a stack trace frame, a
+            # wrapped message, ...) is a *continuation* of whatever
+            # timestamped line came before it — extract_timestamp_fast
+            # returning None is exactly that signal. include_following
+            # carries "did the most recent anchor line match?" forward, so
+            # once an ERROR line matches a search, its whole stack trace
+            # comes along even though the individual "at com.foo.Bar(...)"
+            # lines never contain the search term or a timestamp of their
+            # own. A continuation line can also match independently (e.g.
+            # the search term happens to appear inside the stack trace),
+            # which starts its own "include what follows" run.
+            #
             # Branching once outside the loop (rather than every row) matters
             # at tens of millions of iterations.
             if single_file:
                 mm, offsets, fsize = file_mms[0]
                 total_f = len(offsets)
+                include_following = False
                 for row in range(total):
                     if (row & 0xFFF) == 0 and self._cancelled:
                         return
                     start = offsets[row]
                     end = offsets[row + 1] if row + 1 < total_f else fsize
                     raw = mm[start:end].rstrip(b'\r\n')
-                    if line_matches(raw):
+                    ts = extract_fast(raw)
+                    if ts is not None:
+                        row_pass = line_matches(raw, ts)
+                        if row_pass:
+                            matches.append(row)
+                        include_following = row_pass
+                    elif include_following:
                         matches.append(row)
+                    elif line_matches(raw, ts):
+                        matches.append(row)
+                        include_following = True
                     if total and row % 100000 == 0:
                         percent = int(row * 100 / total)
                         if percent != last_percent:
                             last_percent = percent
                             self.progress.emit(percent)
             else:
+                include_following = False
                 for row in range(total):
                     if (row & 0xFFF) == 0 and self._cancelled:
                         return
@@ -772,8 +794,17 @@ class FilterWorker(QThread):
                     start = offsets[line_no]
                     end = offsets[line_no + 1] if line_no + 1 < total_f else fsize
                     raw = mm[start:end].rstrip(b'\r\n')
-                    if line_matches(raw):
+                    ts = extract_fast(raw)
+                    if ts is not None:
+                        row_pass = line_matches(raw, ts)
+                        if row_pass:
+                            matches.append(row)
+                        include_following = row_pass
+                    elif include_following:
                         matches.append(row)
+                    elif line_matches(raw, ts):
+                        matches.append(row)
+                        include_following = True
                     if total and row % 100000 == 0:
                         percent = int(row * 100 / total)
                         if percent != last_percent:
